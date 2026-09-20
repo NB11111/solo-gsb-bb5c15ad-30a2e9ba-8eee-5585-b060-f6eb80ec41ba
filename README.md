@@ -167,6 +167,33 @@
      `merkle_root`）阶段失败；路径层数、左右方向或奇数层复制配对规则不一致在
      `path` 阶段失败。注意：证明锚定的是「生成时刻的事件集合与链尾快照」，链继续
      追加后旧证明仍然有效，只需重新生成即可获得新快照的证明。
+- **批量选择披露证明（Merkle multiproof）**：一次向第三方披露**多个**交接事件，
+  只需一份证明，且证明体积远小于逐条单事件证明之和：
+  1. **生成证明** `GET /chains/{chain_id}/events/proof?seq=...`：`seq` 可重复
+     传参（如 `?seq=0&seq=3&seq=3`），服务端**去重并升序**后取 1～20 个序号，
+     在**同一个读事务**内取齐该链当前事件集合与当前链尾（同一快照），生成
+     **一份** multiproof。与单事件证明共用同一棵 Merkle 树与同一套哈希规则
+     （叶子/内部节点/快照摘要完全相同，因此同一链态下两种证明的
+     `merkle_root`、`snapshot_digest` 一致）。证明节点以 **(level, index)
+     坐标**寻址：`level` 0 为叶子层、`index` 为层内位置，根位于
+     `(tree_depth(event_count), 0)`；`proof_nodes` 为「各被选叶子兄弟路径的
+     并集减去可由被选叶子自行算出的节点」这一**最小集合**，按
+     `(level, index)` 升序且**不重复**。响应返回：被选事件 `events`（按
+     `seq` 升序，**绝不包含未选择事件**）、`event_count`、`tail_hash`、
+     `merkle_root`、`snapshot_digest` 与 `proof_nodes`（只含节点哈希，不含
+     任何事件内容）。去重后超过 20 个序号返回 **400**（`too_many_seqs`）；
+     链条不存在返回 **404**；任一序号越界（负数或不小于当前事件数）返回
+     **404**（`event_not_found`）。
+  2. **离线校验** `POST /proofs/verify-batch`：**只依据请求体**重算被选事件
+     的叶子，按节点坐标逐层配对（奇数层末节点与自身复制配对）**重建 Merkle
+     根**，并重算 `snapshot_digest`，**完全不读取数据库**。请求体与批量证明
+     响应同构，可**原样回填**；`events` 中仅 `seq`、`event_hash` 参与重算。
+     校验按 **`event_count` → `seq` → `proof_nodes` → `merkle_root` →
+     `snapshot_digest`** 的顺序给出首个失败阶段：重复或越界序号、序号为空或
+     超过 20 个在 `seq` 阶段失败；**缺失或多余节点、坐标重复/越界/冲突
+     （含与被选叶子坐标冲突）、为奇数层末节点提供「兄弟」等不符合自复制规则
+     的证明**在 `proof_nodes` 阶段失败；重建根与声明不一致在 `merkle_root`
+     阶段失败；快照摘要不一致在 `snapshot_digest` 阶段失败。
 
 ## 一条命令启动（依赖安装 + 数据库初始化 + 启动）
 
@@ -224,9 +251,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/chains/{chain_id}/verify` | 完整性校验，指出首个断裂序号 |
 | `GET`  | `/chains/{chain_id}/events/{seq}/proof` | 生成单个事件的 Merkle 包含证明（叶子绑定 chain_id/seq/event_hash；奇数层末节点复制配对；返回事件/左右兄弟路径/事件数/链尾/根/snapshot_digest；seq 越界 404 event_not_found） |
 | `POST` | `/proofs/verify` | 仅依据请求体重算叶子、路径与 snapshot_digest 离线校验，不读数据库；返回 valid 与首个失败阶段 |
+| `GET`  | `/chains/{chain_id}/events/proof` | 批量选择披露证明：对去重且升序的 1～20 个序号（重复传参 seq）生成一份 Merkle multiproof；返回被选事件/event_count/tail_hash/merkle_root/snapshot_digest 与按 (level,index) 排序且不重复的最小 proof_nodes；不泄露未选择事件（>20 个序号 400 too_many_seqs，越界 404 event_not_found） |
+| `POST` | `/proofs/verify-batch` | 仅依据请求体按节点坐标重建根离线校验批量 multiproof，不读数据库；拒绝重复/越界序号、缺失/多余节点、坐标冲突及违反奇数层自复制规则的证明；返回 valid 与首个失败阶段 |
 | `GET`  | `/health` | 健康检查 |
 
 错误响应统一为：`{"error": "<code>", "detail": "<说明>"}`。状态码约定：
+**400** —— `too_many_seqs`（批量证明去重后序号超过 20 个）、
+`seqs_required`（批量证明至少需要一个序号）；
 **409** —— `tail_mismatch`（链尾不匹配/已推进，邀约派生状态为 `terminated`；
 创建封存时链尾不匹配同样返回此码）、
 `nonce_replay`（随机数重放）、
@@ -556,6 +587,46 @@ curl -s -X POST http://localhost:8000/proofs/verify \
 curl -i http://localhost:8000/chains/ab12.../events/999/proof
 ```
 
+### 批量选择披露证明（Merkle multiproof）示例
+
+```bash
+# 1) 一次披露序号 0、2、4 三个交接事件（seq 可重复传参，重复与乱序自动去重升序）
+curl -s "http://localhost:8000/chains/ab12.../events/proof?seq=4&seq=0&seq=2&seq=2"
+# 200 响应（与单事件证明同一棵 Merkle 树，merkle_root/snapshot_digest 相同）：
+# {
+#   "chain_id": "ab12...",
+#   "events": [ {"seq": 0, ...}, {"seq": 2, ...}, {"seq": 4, ...} ],   # 仅被选事件
+#   "event_count": 6,
+#   "tail_hash": "6aae...",                       # 同一读事务快照下的当前链尾
+#   "merkle_root": "9112...",
+#   "snapshot_digest": "3a3d...",
+#   "proof_nodes": [                              # 最小集合，按 (level,index) 排序不重复
+#     {"level": 0, "index": 1, "hash": "a142..."},
+#     {"level": 1, "index": 1, "hash": "77be..."}
+#   ]
+# }
+
+# 2) 离线校验：把批量证明响应原样回填即可（服务端不读数据库，只按坐标重建根）
+curl -s -X POST http://localhost:8000/proofs/verify-batch \
+  -H 'Content-Type: application/json' \
+  -d @batch-proof.json
+# {"valid": true, "failed_stage": null, "reason": null,
+#  "chain_id": "ab12...", "seqs": [0, 2, 4],
+#  "recomputed_merkle_root": "9112...",
+#  "recomputed_snapshot_digest": "3a3d..."}
+
+# 3) 拒绝情形（仍返回 200，valid=false 并给出首个失败阶段）：
+#    序号重复 / 越界 / 为空 / 超过 20 个      -> failed_stage="seq"
+#    缺失或多余节点、坐标重复/越界/冲突、
+#    为奇数层末节点提供「兄弟」节点           -> failed_stage="proof_nodes"
+#    篡改 event_hash / chain_id / 节点哈希    -> failed_stage="merkle_root"
+#    篡改 tail_hash / snapshot_digest         -> failed_stage="snapshot_digest"
+#    event_count <= 0                         -> failed_stage="event_count"
+
+# 4) 去重后超过 20 个序号 -> 400 too_many_seqs；任一序号越界 -> 404 event_not_found
+curl -i "http://localhost:8000/chains/ab12.../events/proof?seq=0&seq=1&seq=2&...&seq=20"
+```
+
 哈希细节（三种固定域分隔，互不构成第二原像）：
 
 - 叶子：`SHA256("merkle-leaf:v1:" + sort_keys_json({"chain_id":…,"event_hash":…,"seq":…}))`
@@ -629,8 +700,8 @@ curl -i http://localhost:8000/chains/ab12.../events/999/proof
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由与启动
-│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 原子替换 / 见证 / 争议封存 / 查询 / 校验 / Merkle 包含证明生成与校验）
-│   ├── merkle.py      # Merkle 包含证明纯函数：叶子/内部节点/快照摘要、构造与离线重算（不读数据库）
+│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 原子替换 / 见证 / 争议封存 / 查询 / 校验 / Merkle 包含证明与批量 multiproof 的生成与校验）
+│   ├── merkle.py      # Merkle 证明纯函数：叶子/内部节点/快照摘要、单事件包含证明与批量 multiproof 的构造与离线重算（不读数据库）
 │   ├── database.py    # SQLite 连接、建表与旧 offers 表重建迁移、串行写事务
 │   ├── hashing.py     # 紧凑 JSON 规范与 SHA-256
 │   ├── schemas.py     # Pydantic 请求/响应模型
