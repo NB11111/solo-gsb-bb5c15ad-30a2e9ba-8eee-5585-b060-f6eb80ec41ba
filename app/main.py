@@ -3,14 +3,17 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import config, database
 from .schemas import (
+    BatchProofVerifyRequest,
+    BatchProofVerifyResult,
     ChainOut,
     ChainSummary,
     CreateChainRequest,
+    EventBatchProofOut,
     EventProofOut,
     HandoverRequest,
     HandoverResult,
@@ -43,6 +46,7 @@ from .service import (
     create_seal,
     get_chain,
     get_event_proof,
+    get_events_proof,
     get_latest_seal,
     get_offer,
     get_seal,
@@ -51,6 +55,7 @@ from .service import (
     record_witness_decision,
     release_seal,
     replace_offer,
+    verify_batch_proof,
     verify_chain,
     verify_event_proof,
 )
@@ -66,7 +71,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="文件交接留痕服务",
     description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验。",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -332,6 +337,37 @@ def api_get_event_proof(chain_id: str, seq: int) -> EventProofOut:
     return EventProofOut(**get_event_proof(chain_id, seq))
 
 
+@app.get(
+    "/chains/{chain_id}/events/proof",
+    response_model=EventBatchProofOut,
+    tags=["proofs"],
+    summary="批量生成多个交接事件的 Merkle multiproof（可选择披露）",
+    description=(
+        "对去重且升序的 1～20 个序号（查询参数 seq 可重复传入）生成**一份**"
+        " Merkle multiproof：事件集合与当前链尾在同一读事务内取得（同一快照），"
+        "哈希规则与单事件证明一致（叶子绑定 chain_id/seq/event_hash，内部节点"
+        '为 SHA256("merkle-node:v1:"+左+右)，奇数层末节点与自身复制配对）。'
+        "响应返回被选事件（按 seq 升序，绝不包含未选择事件）、event_count、"
+        "tail_hash、merkle_root、snapshot_digest，以及按 (level, index) 升序"
+        "且不重复的最小 proof_nodes（level 0 为叶子层；奇数层自复制位置不产生"
+        "证明节点）。去重后超过 20 个序号返回 400 too_many_seqs；链条不存在"
+        "返回 404；任一序号越界（负数或不小于当前事件数）返回 404 "
+        "event_not_found。"
+    ),
+)
+def api_get_events_proof(
+    chain_id: str,
+    seq: list[int] = Query(
+        ...,
+        description=(
+            "要证明的事件序号，可重复传入（如 ?seq=0&seq=3&seq=7）；"
+            "服务端去重并升序排列，去重后 1～20 个"
+        ),
+    ),
+) -> EventBatchProofOut:
+    return EventBatchProofOut(**get_events_proof(chain_id, seq))
+
+
 @app.post(
     "/proofs/verify",
     response_model=ProofVerifyResult,
@@ -357,6 +393,35 @@ def api_verify_proof(req: ProofVerifyRequest) -> ProofVerifyResult:
             tail_hash=req.tail_hash,
             merkle_root=req.merkle_root,
             snapshot_digest_claim=req.snapshot_digest,
+        )
+    )
+
+
+@app.post(
+    "/proofs/verify-batch",
+    response_model=BatchProofVerifyResult,
+    tags=["proofs"],
+    summary="离线校验批量 Merkle multiproof（不读取数据库）",
+    description=(
+        "仅依据请求体按节点坐标重建 Merkle 根并重算 snapshot_digest：按 "
+        "event_count → events → proof_nodes → merkle_root → snapshot_digest "
+        "的顺序给出首个失败阶段 failed_stage，全部通过 valid 才为 true。"
+        "重复或越界序号、缺失或多余节点、坐标冲突（重复坐标或与重算值不一致）"
+        "以及不符合奇数层自复制规则的证明一律拒绝。请求体与批量证明响应同构，"
+        "可原样回填；events 中除 seq、event_hash 外的字段被忽略。本接口不读取"
+        "数据库，可在任何离线环境复算。"
+    ),
+)
+def api_verify_batch_proof(req: BatchProofVerifyRequest) -> BatchProofVerifyResult:
+    return BatchProofVerifyResult(
+        **verify_batch_proof(
+            chain_id=req.chain_id,
+            events=[event.model_dump() for event in req.events],
+            event_count=req.event_count,
+            tail_hash=req.tail_hash,
+            merkle_root=req.merkle_root,
+            snapshot_digest_claim=req.snapshot_digest,
+            proof_nodes=[node.model_dump() for node in req.proof_nodes],
         )
     )
 

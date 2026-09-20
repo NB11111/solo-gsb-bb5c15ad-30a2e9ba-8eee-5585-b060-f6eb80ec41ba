@@ -113,6 +113,18 @@
 - POST /proofs/verify：**只依据请求体重算**叶子、兄弟路径与 snapshot_digest，
   不读取数据库；请求体与证明响应同构，可原样回填。首个失败阶段按
   event_count -> seq -> path -> merkle_root -> snapshot_digest 顺序返回。
+- GET /chains/{chain_id}/events/proof?seq=...：批量版本。对去重且升序的
+  1～20 个序号生成一份 Merkle multiproof：同一读事务内取齐事件与链尾，
+  响应返回被选事件（按 seq 升序）、event_count、tail_hash、merkle_root、
+  snapshot_digest，以及按 (level, index) 升序且不重复的最小 proof_nodes
+  （level 0 为叶子层；奇数层末节点自复制配对，不产生证明节点）。去重后
+  超过 20 个序号返回 400 too_many_seqs；任一序号越界返回 404
+  event_not_found。响应只含被选事件，不泄露未选择事件。
+- POST /proofs/verify-batch：批量证明的离线校验，**只依据请求体**按节点
+  坐标重建根，不读取数据库；请求体与批量证明响应同构，可原样回填（events
+  中仅 seq、event_hash 参与重算）。首个失败阶段按 event_count -> events ->
+  proof_nodes -> merkle_root -> snapshot_digest 顺序返回；重复或越界序号、
+  缺失或多余节点、坐标冲突、不符合奇数层自复制规则的证明一律拒绝。
 """
 from __future__ import annotations
 
@@ -1365,6 +1377,167 @@ def verify_event_proof(
         "chain_id": chain_id,
         "seq": seq,
         "recomputed_leaf_hash": recomputed_leaf,
+        "recomputed_merkle_root": root,
+        "recomputed_snapshot_digest": recomputed_snapshot,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 批量可选择披露证明（Merkle multiproof）
+# ---------------------------------------------------------------------------
+
+
+def get_events_proof(chain_id: str, seqs: list[int]) -> dict[str, Any]:
+    """为去重且升序的 1～20 个序号生成一份 Merkle multiproof。
+
+    事件集合与当前链尾必须在**同一个读事务**内取得（与单事件证明同一快照
+    语义）。请求中的序号先去重、按升序排列；去重后超过
+    merkle.MAX_MULTI_PROOF_LEAVES 个返回 400 too_many_seqs。链条不存在返回
+    404 not_found；任一序号越界（负数或不小于当前事件数）返回 404
+    event_not_found。响应只包含被选事件，绝不泄露未选择事件；proof_nodes
+    为按 (level, index) 升序且不重复的最小兄弟节点集合。
+    """
+    unique_sorted = sorted(set(seqs))
+    if not unique_sorted:
+        raise ChainError(
+            400, "too_few_seqs", "至少需要 1 个事件序号（查询参数 seq）"
+        )
+    if len(unique_sorted) > merkle.MAX_MULTI_PROOF_LEAVES:
+        raise ChainError(
+            400,
+            "too_many_seqs",
+            f"批量证明一次最多选择 {merkle.MAX_MULTI_PROOF_LEAVES} 个事件序号"
+            f"（去重后为 {len(unique_sorted)} 个）",
+        )
+
+    with read_tx() as conn:
+        chain = conn.execute(
+            "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
+        ).fetchone()
+        if chain is None:
+            raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+        rows = conn.execute(
+            "SELECT * FROM events WHERE chain_id = ? ORDER BY seq", (chain_id,)
+        ).fetchall()
+
+    event_count = len(rows)
+    for seq in unique_sorted:
+        if seq < 0 or seq >= event_count:
+            raise ChainError(
+                404,
+                "event_not_found",
+                f"事件序号越界: {seq}（该链当前共 {event_count} 个事件）",
+            )
+
+    event_hashes = [row["event_hash"] for row in rows]
+    proof = merkle.build_multi_proof(chain_id, event_hashes, unique_sorted)
+    snapshot = merkle.snapshot_digest(
+        chain_id=chain_id,
+        event_count=event_count,
+        tail_hash=chain["tail_hash"],
+        merkle_root=proof["merkle_root"],
+    )
+
+    return {
+        "chain_id": chain_id,
+        "events": [_row_to_event(rows[seq]) for seq in unique_sorted],
+        "event_count": event_count,
+        "tail_hash": chain["tail_hash"],
+        "merkle_root": proof["merkle_root"],
+        "snapshot_digest": snapshot,
+        "proof_nodes": proof["proof_nodes"],
+    }
+
+
+def verify_batch_proof(
+    chain_id: str,
+    events: list[dict[str, Any]],
+    event_count: int,
+    tail_hash: str,
+    merkle_root: str,
+    snapshot_digest_claim: str,
+    proof_nodes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """仅依据请求体按节点坐标重建 Merkle 根并校验批量证明，**不读取数据库**。
+
+    依次重算：各被选事件的叶子（绑定 chain_id/seq/event_hash）→ 按证明节点
+    坐标逐层重建 Merkle 根（奇数层末节点自复制）→ snapshot_digest。首个失败
+    阶段即停止，阶段顺序为 event_count → events → proof_nodes → merkle_root
+    → snapshot_digest。重复或越界序号、缺失或多余节点、坐标冲突以及不符合
+    奇数层自复制规则的证明一律拒绝（valid=false）。
+    """
+    recomputed_leaves = [
+        merkle.leaf_hash(chain_id, event["seq"], event["event_hash"])
+        for event in events
+    ]
+    recomputed_snapshot = merkle.snapshot_digest(
+        chain_id=chain_id,
+        event_count=event_count,
+        tail_hash=tail_hash,
+        merkle_root=merkle_root,
+    )
+
+    root, failed_stage, context = merkle.evaluate_multi_inclusion(
+        chain_id=chain_id,
+        event_count=event_count,
+        events=[(event["seq"], event["event_hash"]) for event in events],
+        proof_nodes=[
+            (node["level"], node["index"], node["node_hash"])
+            for node in proof_nodes
+        ],
+    )
+
+    reason: Optional[str] = None
+    if failed_stage == merkle.STAGE_EVENT_COUNT:
+        reason = f"event_count 非法：{event_count}，必须为 >= 1 的整数"
+    elif failed_stage == merkle.STAGE_EVENTS:
+        if context.get("duplicate_seq"):
+            reason = "events 中存在重复序号：批量证明的序号必须去重"
+        elif "seq" in context:
+            reason = (
+                f"事件序号越界：{context['seq']} 不在 [0, {event_count}) 范围内"
+            )
+        else:
+            reason = (
+                "events 数量非法：批量证明一次选择 1～"
+                f"{merkle.MAX_MULTI_PROOF_LEAVES} 个事件"
+            )
+    elif failed_stage == merkle.STAGE_PROOF_NODES:
+        coord = f"(level={context.get('level')}, index={context.get('index')})"
+        if context.get("out_of_bounds"):
+            reason = (
+                f"证明节点坐标越界：{coord} 不在事件数为 {event_count} 的"
+                "Merkle 树范围内（含奇数层末节点自复制位置之外不存在节点）"
+            )
+        elif context.get("duplicate_coordinate"):
+            reason = f"证明节点坐标重复：{coord} 出现多次"
+        elif context.get("missing"):
+            reason = f"缺失必需的证明节点：{coord}"
+        elif context.get("conflict"):
+            reason = f"证明节点与重算值坐标冲突：{coord} 的哈希不一致"
+        else:  # extra
+            reason = f"多余的证明节点：{coord} 并非重建根所必需"
+    elif root != merkle_root:
+        failed_stage = merkle.STAGE_ROOT
+        reason = (
+            "Merkle 根不匹配：按请求体重算为 "
+            f"{root}，请求声明为 {merkle_root}"
+        )
+    elif recomputed_snapshot != snapshot_digest_claim:
+        failed_stage = merkle.STAGE_SNAPSHOT
+        reason = (
+            "链尾快照摘要不匹配：按 chain_id/event_count/merkle_root/"
+            f"tail_hash 重算为 {recomputed_snapshot}，"
+            f"请求声明为 {snapshot_digest_claim}"
+        )
+
+    return {
+        "valid": failed_stage is None,
+        "failed_stage": failed_stage,
+        "reason": reason,
+        "chain_id": chain_id,
+        "seqs": [event["seq"] for event in events],
+        "recomputed_leaf_hashes": recomputed_leaves,
         "recomputed_merkle_root": root,
         "recomputed_snapshot_digest": recomputed_snapshot,
     }

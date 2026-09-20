@@ -350,6 +350,156 @@ class ProofVerifyResult(BaseModel):
     )
 
 
+class ProofNodeOut(BaseModel):
+    """Merkle multiproof 的证明节点：以 (level, index) 坐标定位。"""
+
+    level: int = Field(..., description="节点所在层：0 为叶子层，逐层向根递增")
+    index: int = Field(..., description="节点在该层内的序号（0 起）")
+    node_hash: str = Field(
+        ..., description="该坐标处的 Merkle 节点摘要（64 位十六进制）"
+    )
+
+
+class EventBatchProofOut(BaseModel):
+    chain_id: str
+    events: list[EventOut] = Field(
+        ...,
+        description=(
+            "被证明包含的交接事件（按 seq 升序、去重）；只包含被选事件，"
+            "不泄露未选择事件"
+        ),
+    )
+    event_count: int = Field(
+        ..., description="生成证明时该链的事件总数（含创世记录）"
+    )
+    tail_hash: str = Field(
+        ..., description="同一读事务下该链的当前链尾哈希（事件集合与链尾为同一快照）"
+    )
+    merkle_root: str = Field(
+        ..., description="按当前事件集合计算的 Merkle 根；单事件链时即叶子哈希"
+    )
+    snapshot_digest: str = Field(
+        ...,
+        description=(
+            "链尾快照摘要：SHA256(\"merkle-snapshot:v1:\" + 规范 JSON"
+            "{chain_id,event_count,merkle_root,tail_hash})，把证明锚定到本次快照"
+        ),
+    )
+    proof_nodes: list[ProofNodeOut] = Field(
+        ...,
+        description=(
+            "重建根所需的最小兄弟节点集合：按 (level, index) 升序且不重复；"
+            "奇数层末节点与自身复制配对，自复制位置不产生证明节点"
+        ),
+    )
+
+
+class BatchProofEventClaim(BaseModel):
+    """批量校验请求中的事件声明：校验端只信链 ID、序号与事件哈希并重算叶子。"""
+
+    seq: int = Field(..., description="被证明事件的序号（>= 0）")
+    event_hash: str = Field(..., description="被证明事件的 SHA-256 摘要（64 位十六进制）")
+
+    @field_validator("event_hash")
+    @classmethod
+    def _check_event_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "event_hash")
+
+    model_config = {"extra": "ignore"}
+
+
+class ProofNodeInput(BaseModel):
+    """批量校验请求中的证明节点：坐标与摘要，语义与 ProofNodeOut 一致。"""
+
+    level: int = Field(..., description="节点所在层：0 为叶子层")
+    index: int = Field(..., description="节点在该层内的序号（0 起）")
+    node_hash: str = Field(..., description="该坐标处的 Merkle 节点摘要（64 位十六进制）")
+
+    @field_validator("node_hash")
+    @classmethod
+    def _check_node_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "node_hash")
+
+    model_config = {"extra": "ignore"}
+
+
+class BatchProofVerifyRequest(BaseModel):
+    """POST /proofs/verify-batch 请求体。
+
+    与批量证明响应同构，可将证明响应原样回填；服务端只依据本体重算叶子、
+    按节点坐标重建 Merkle 根与 snapshot_digest，**不读取数据库**。events
+    中仅 seq、event_hash 参与重算，其余字段被忽略。
+    """
+
+    chain_id: str = Field(..., description="证明所属交接链 ID")
+    events: list[BatchProofEventClaim] = Field(
+        ..., description="被证明事件声明（1～20 个，序号不得重复）"
+    )
+    event_count: int = Field(..., description="生成证明时声明的事件总数")
+    tail_hash: str = Field(..., description="生成证明时快照中的当前链尾哈希")
+    merkle_root: str = Field(..., description="生成证明时声明的 Merkle 根")
+    snapshot_digest: str = Field(
+        ..., description="生成证明时返回的链尾快照摘要，服务端自行重算后比对"
+    )
+    proof_nodes: list[ProofNodeInput] = Field(
+        ..., description="待校验的证明节点集合（按坐标参与重建，可为空列表）"
+    )
+
+    @field_validator("chain_id")
+    @classmethod
+    def _check_chain_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("chain_id 不能为空")
+        return v
+
+    @field_validator("tail_hash")
+    @classmethod
+    def _check_tail_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "tail_hash")
+
+    @field_validator("merkle_root")
+    @classmethod
+    def _check_merkle_root(cls, v: str) -> str:
+        return _validate_hex64(v, "merkle_root")
+
+    @field_validator("snapshot_digest")
+    @classmethod
+    def _check_snapshot_digest(cls, v: str) -> str:
+        return _validate_hex64(v, "snapshot_digest")
+
+
+class BatchProofVerifyResult(BaseModel):
+    valid: bool = Field(
+        ...,
+        description=(
+            "仅当按坐标重建的根 == merkle_root 且 snapshot_digest 重算一致、"
+            "证明节点最小且无冲突时为 true"
+        ),
+    )
+    failed_stage: Optional[Literal[
+        "event_count", "events", "proof_nodes", "merkle_root", "snapshot_digest"
+    ]] = Field(
+        None,
+        description=(
+            "首个失败阶段（按 event_count → events → proof_nodes → "
+            "merkle_root → snapshot_digest 顺序）；valid=true 时为 null"
+        ),
+    )
+    reason: Optional[str] = Field(None, description="失败原因说明；成功为 null")
+    chain_id: str
+    seqs: list[int] = Field(..., description="请求中声明的被证明事件序号（按请求顺序）")
+    recomputed_leaf_hashes: list[str] = Field(
+        ..., description="按 chain_id/seq/event_hash 重算的叶子摘要（与 events 同序）"
+    )
+    recomputed_merkle_root: Optional[str] = Field(
+        None, description="按节点坐标重建的 Merkle 根；证明节点非法时为 null"
+    )
+    recomputed_snapshot_digest: str = Field(
+        ..., description="按声明根/链尾/事件数重算的快照摘要（始终计算）"
+    )
+
+
 class WitnessInput(BaseModel):
     name: str = Field(..., description="见证人标识")
     token: str = Field(
